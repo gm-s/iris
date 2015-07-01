@@ -51,6 +51,16 @@ class Test(tests.IrisTest):
                                   aux_coords_and_dims=[(bibble, None)],
                                   attributes=attributes)
 
+        # Source cube 3d.
+        cubes = iris.cube.CubeList()
+        for level in range(2):
+            coord = iris.coords.DimCoord(level, standard_name='altitude')
+            cube = self.src.copy()
+            cube.data += level
+            cube.add_aux_coord(coord)
+            cubes.append(cube)
+        self.src_3d = cubes.merge_cube()
+
         # Source cube x-coordinates.
         points = np.array([[010, 020, 200, 220],
                            [110, 120, 180, 185],
@@ -110,27 +120,33 @@ class Test(tests.IrisTest):
                                                bounds=[[30, 5],
                                                        [5, 0]])
 
-    def _weighted_mean(self, points):
+    def _weighted_mean(self, points, weights=None):
         points = np.asarray(points, dtype=np.float)
-        weights = points * self.weight_factor
+        if weights is None:
+            weights = points * self.weight_factor
         numerator = denominator = 0
         for point, weight in zip(points, weights):
             numerator += point * weight
             denominator += weight
         return numerator / denominator
 
-    def _expected_cube(self, data):
+    def _expected_cube(self, data, src=None):
+        if src is None:
+            src = self.src
         cube = iris.cube.Cube(data)
-        cube.metadata = copy.deepcopy(self.src)
+        cube.metadata = copy.deepcopy(src)
         grid_x = self.grid.coord('longitude')
         grid_y = self.grid.coord('latitude')
-        cube.add_dim_coord(grid_x.copy(), self.grid.coord_dims(grid_x))
-        cube.add_dim_coord(grid_y.copy(), self.grid.coord_dims(grid_y))
-        src_x = self.src.coord('longitude')
-        src_y = self.src.coord('latitude')
-        for coord in self.src.aux_coords:
+        cube.add_dim_coord(grid_x.copy(), self.grid.coord_dims(grid_x)[0] + src.ndim - 2)
+        cube.add_dim_coord(grid_y.copy(), self.grid.coord_dims(grid_y)[0] + src.ndim - 2)
+        src_x = src.coord('longitude')
+        src_y = src.coord('latitude')
+        for coord in src.dim_coords:
+            if coord not in [src_x, src_y]:
+                cube.add_dim_coord(coord, src.coord_dims(coord))
+        for coord in src.aux_coords:
             if coord is not src_x and coord is not src_y:
-                if not self.src.coord_dims(coord):
+                if not src.coord_dims(coord):
                     cube.add_aux_coord(coord)
         return cube
 
@@ -271,6 +287,30 @@ class Test(tests.IrisTest):
         mask = np.array([[False, False], [False, False]])
         self.assertArrayEqual(result.data.mask, mask)
 
+    def test_aligned_src_3d_x(self):
+        self.src_3d.add_aux_coord(self.src_y, (1, 2))
+        self.src_3d.add_aux_coord(self.src_x_positive, (1, 2))
+        self.grid.add_dim_coord(self.grid_y_inc, 0)
+        self.grid.add_dim_coord(self.grid_x_inc, 1)
+        result = regrid(self.src_3d, self.weights, self.grid)
+        data = np.array([0,
+                         self._weighted_mean([3]),
+                         self._weighted_mean([7, 8]),
+                         self._weighted_mean([9, 10, 11]),
+                         1, 4, self._weighted_mean([8, 9], weights=[70, 80]),
+                         self._weighted_mean([10, 11, 12], weights=[90, 100, 110])]).reshape(2, 2, 2)
+        mask = np.array([[[True, False], [False, False]],
+                         [[True, False], [False, False]]])
+        data = np.ma.MaskedArray(data, mask)
+        expected = self._expected_cube(data, src=self.src_3d)
+        print(type(expected.data))
+        # Check the data matches first
+        self.assertMaskedArrayAlmostEqual(result.data, expected.data)
+        # Then check the rest of the metadata matches
+        expected.data = result.data
+        expected.data = np.zeros(expected.shape)
+        result.data = np.zeros(result.shape)
+        self.assertEqual(result, expected)
 
 if __name__ == '__main__':
     tests.main()

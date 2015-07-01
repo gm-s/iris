@@ -814,13 +814,13 @@ def regrid_weighted_curvilinear_to_rectilinear(src_cube, weights, grid_cube):
         A :class:`iris.cube.Cube` instance.
 
     """
-    if src_cube.shape != weights.shape:
-        msg = 'The source cube and weights require the same data shape.'
-        raise ValueError(msg)
+    # if src_cube.shape != weights.shape:
+    #     msg = 'The source cube and weights require the same data shape.'
+    #     raise ValueError(msg)
 
-    if src_cube.ndim != 2 or grid_cube.ndim != 2:
-        msg = 'The source cube and target grid cube must reference 2D data.'
-        raise ValueError(msg)
+    # if src_cube.ndim != 2 or grid_cube.ndim != 2:
+    #     msg = 'The source cube and target grid cube must reference 2D data.'
+    #     raise ValueError(msg)
 
     if src_cube.aux_factories:
         msg = 'All source cube derived coordinates will be ignored.'
@@ -884,12 +884,13 @@ def regrid_weighted_curvilinear_to_rectilinear(src_cube, weights, grid_cube):
         # Return a flattened, unmasked copy of a coordinate's points array that
         # will align with a flattened version of the source cube's data.
         points = coord.points
-        if src_cube.coord_dims(coord) == (1, 0):
+        a, b = src_cube.coord_dims(coord)
+        if a > b:
             points = points.T
-        if points.shape != src_cube.shape:
-            msg = 'The shape of the points array of !r is not compatible ' \
-                'with the shape of !r.'.format(coord.name(), src_cube.name())
-            raise ValueError(msg)
+        # if points.shape != src_cube.shape:
+        #     msg = 'The shape of the points array of {!r} is not compatible ' \
+        #         'with the shape of {!r}.'.format(coord.name(), src_cube.name())
+        #     raise ValueError(msg)
         return np.asarray(points.flatten())
 
     # Align and flatten the coordinate points of the source space.
@@ -964,7 +965,10 @@ def regrid_weighted_curvilinear_to_rectilinear(src_cube, weights, grid_cube):
     # Determine the valid indices and their offsets in M x N space.
     if ma.isMaskedArray(src_cube.data):
         # Calculate the valid M offsets, accounting for the source cube mask.
-        mask = ~src_cube.data.mask.flatten()
+        mask = src_cube.data.mask
+        if mask.ndim > 2:
+            mask = mask[0]
+        mask = ~mask.flatten()
         cols = np.where((y_indices >= 0) & (y_indices < ty_depth) &
                         (x_indices >= 0) & (x_indices < tx_depth) &
                         mask)[0]
@@ -987,29 +991,44 @@ def regrid_weighted_curvilinear_to_rectilinear(src_cube, weights, grid_cube):
     weights_flat = weights.flatten()
     data = weights_flat[cols]
 
+    shape = src_cube.shape
+    N = shape[1] * shape[2]
+    M = grid_cube.data.size
+
     # Build our sparse M x N matrix of weights.
     sparse_matrix = csc_matrix((data, (rows, cols)),
-                               shape=(grid_cube.data.size, src_cube.data.size))
+                               shape=(M, N))
 
     # Performing a sparse sum to collapse the matrix to (M, 1).
     sum_weights = sparse_matrix.sum(axis=1).getA()
 
     # Determine the rows (flattened target indices) that have a
     # contribution from one or more source points.
-    rows = np.nonzero(sum_weights)
+    rows, _ = np.nonzero(sum_weights)
+
+    data = src_cube.data
+    data = data.transpose(1, 2, 0)
+    data = data.reshape(N, -1)
 
     # Calculate the numerator of the weighted mean (M, 1).
-    numerator = sparse_matrix * src_cube.data.reshape(-1, 1)
+    numerator = sparse_matrix * data
 
     # Calculate the weighted mean payload.
     weighted_mean = ma.masked_all(numerator.shape, dtype=numerator.dtype)
     weighted_mean[rows] = numerator[rows] / sum_weights[rows]
 
+    payload = weighted_mean.reshape(grid_cube.shape + weighted_mean.shape[1:])
+    payload = payload.transpose(2, 0, 1)
+
     # Construct the final regridded weighted mean cube.
-    dim_coords_and_dims = list(zip((ty.copy(), tx.copy()), (ty_dim, tx_dim)))
-    cube = iris.cube.Cube(weighted_mean.reshape(grid_cube.shape),
+    dim_coords_and_dims = list(zip((ty.copy(), tx.copy()), (ty_dim + 1, tx_dim + 1)))  # TODO: Fix ty/tx dims
+    cube = iris.cube.Cube(payload,
                           dim_coords_and_dims=dim_coords_and_dims)
     cube.metadata = copy.deepcopy(src_cube.metadata)
+
+    # TODO: Add non-grid dimensions from source cube.
+    # Crib some code from one of the other regridders.
+    cube.add_dim_coord(src_cube.dim_coords[0], 0)
 
     for coord in src_cube.coords(dimensions=()):
         cube.add_aux_coord(coord.copy())
