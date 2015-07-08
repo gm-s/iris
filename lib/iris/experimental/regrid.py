@@ -902,11 +902,13 @@ def regrid_weighted_curvilinear_to_rectilinear(src_cube, weights, grid_cube):
     min_sx, min_tx = np.min(sx.points), np.min(tx.points)
     modulus = sx.units.modulus
     if min_sx < 0 and min_tx >= 0:
-        indices = np.where(sx_points < 0)
-        sx_points[indices] += modulus
+        # indices = np.where(sx_points < 0)
+        # sx_points[indices] += modulus
+        sx_points = sx_points + modulus
     elif min_sx >= 0 and min_tx < 0:
-        indices = np.where(sx_points > (modulus / 2))
-        sx_points[indices] -= modulus
+        # indices = np.where(sx_points > (modulus / 2))
+        # sx_points[indices] -= modulus
+        sx_points = sx_points - (modulus / 2)
 
     # Create target grid cube x and y cell boundaries.
     tx_depth, ty_depth = tx.points.size, ty.points.size
@@ -986,6 +988,254 @@ def regrid_weighted_curvilinear_to_rectilinear(src_cube, weights, grid_cube):
         rows = y_indices * tx.points.size + x_indices
     else:
         rows = x_indices * ty.points.size + y_indices
+
+    # Calculate the associated valid weights.
+    weights_flat = weights.flatten()
+    data = weights_flat[cols]
+
+    shape = src_cube.shape
+    N = shape[1] * shape[2]
+    M = grid_cube.data.size
+
+    # Build our sparse M x N matrix of weights.
+    sparse_matrix = csc_matrix((data, (rows, cols)),
+                               shape=(M, N))
+
+    # Performing a sparse sum to collapse the matrix to (M, 1).
+    sum_weights = sparse_matrix.sum(axis=1).getA()
+
+    # Determine the rows (flattened target indices) that have a
+    # contribution from one or more source points.
+    rows, _ = np.nonzero(sum_weights)
+
+    data = src_cube.data
+    data = data.transpose(1, 2, 0)
+    data = data.reshape(N, -1)
+
+    # Calculate the numerator of the weighted mean (M, 1).
+    numerator = sparse_matrix * data
+
+    # Calculate the weighted mean payload.
+    weighted_mean = ma.masked_all(numerator.shape, dtype=numerator.dtype)
+    weighted_mean[rows] = numerator[rows] / sum_weights[rows]
+
+    payload = weighted_mean.reshape(grid_cube.shape + weighted_mean.shape[1:])
+    payload = payload.transpose(2, 0, 1)
+
+    # Construct the final regridded weighted mean cube.
+    dim_coords_and_dims = list(zip((ty.copy(), tx.copy()), (ty_dim + 1, tx_dim + 1)))  # TODO: Fix ty/tx dims
+    cube = iris.cube.Cube(payload,
+                          dim_coords_and_dims=dim_coords_and_dims)
+    cube.metadata = copy.deepcopy(src_cube.metadata)
+
+    # TODO: Add non-grid dimensions from source cube.
+    # Crib some code from one of the other regridders.
+    cube.add_dim_coord(src_cube.dim_coords[0], 0)
+
+    for coord in src_cube.coords(dimensions=()):
+        cube.add_aux_coord(coord.copy())
+
+    return cube
+
+
+# XXX: nuked the weights (for now) ...
+def point_in_cell(src_cube, grid_cube, sample=None):
+    # XXX: Assume src has (z, y, x) order for now ...
+    if src_cube.ndim != 3:
+        msg = 'The source cube must reference 2D data.'
+        raise ValueError(msg)
+
+    if sample is None or sample == 0:
+        sample = 1
+
+    if src_cube.aux_factories:
+        msg = 'All source cube derived coordinates will be ignored.'
+        warnings.warn(msg)
+
+    # Convert src spatial to tgt domain ...
+    sx, sy = src_cube.coord(axis='x'), src_cube.coord(axis='y')
+    tx, ty = get_xy_dim_coords(grid_cube)
+
+    if sx.ndim != sy.ndim:
+        msg = 'The source cube x ({!r}) and y ({!r}) coordinates must ' \
+            'have the same dimensionality.'
+        raise ValueError(msg.format(sx.name(), sy.name()))
+
+    if sx.coord_system != sy.coord_system:
+        msg = 'The source cube x ({!r}) and y ({!r}) coordinates must ' \
+            'have the same coordinate system.'
+        raise ValueError(msg.format(sx.name(), sy.name()))
+
+    if not tx.has_bounds() or not tx.is_contiguous():
+        msg = 'The target grid cube x ({!r})coordinate requires ' \
+            'contiguous bounds.'
+        raise ValueError(msg.format(tx.name()))
+
+    if not ty.has_bounds() or not ty.is_contiguous():
+        msg = 'The target grid cube y ({!r}) coordinate requires ' \
+            'contiguous bounds.'
+        raise ValueError(msg.format(ty.name()))
+
+    # XXX: Assume src is rectilinear for now ...
+    if sx.ndim != 1 or sy.ndim != 1:
+        msg = 'The source cube must have rectilinear spatial coordinates.'
+        raise ValueError(msg)
+
+    if not sx.has_bounds():
+        sx.guess_bounds()
+    if not sy.has_bounds():
+        sy.guess_bounds()
+
+    def project(src_coord_system, grid_coord_system, grid_x, grid_y):
+        mesh_x, mesh_y = np.meshgrid(grid_x, grid_y)
+        if src_coord_system == grid_coord_system:
+            sample_x, sample_y = mesh_x, mesh_y
+        else:
+            src_crs = src_coord_system.as_cartopy_crs()
+            grid_crs = grid_coord_system.as_cartopy_crs()
+            sample_xyz = src_crs.transform_points(grid_crs, mesh_x, mesh_y)
+            sample_x = sample_xyz[..., 0]
+            sample_y = sample_xyz[..., 1]
+        return sample_x, sample_y
+
+    def resample(bounds, sample):
+        cells = np.concatenate((bounds[:, 0], bounds[-1, 1].reshape(-1)))
+        diff = np.diff(cells)
+        start = bounds[:, 0]
+        offsets = diff / (2 * np.float(sample))
+        offsets = np.repeat(offsets, sample).reshape(-1, sample)
+        steps = diff / np.float(sample)
+        steps = np.repeat(steps, sample).reshape(-1, sample) * np.arange(sample)
+        points = np.repeat(start, sample).reshape(-1, sample)
+        points = points + steps + offsets
+        return points.flatten()
+
+    if sample == 1:
+        sx_points, sy_points = project(tx.coord_system, sx.coord_system,
+                                       sx.points, sy.points)
+    else:
+        sx_resample = resample(sx.bounds, sample)
+        sy_resample = resample(sy.bounds, sample)
+        sx_points, sy_points = project(tx.coord_system, sx.coord_system,
+                                       sx_resample, sy_resample)
+
+    def _src_align_and_flatten(points, transpose):
+        # Return a flattened, unmasked copy of a coordinate's points array that
+        # will align with a flattened version of the source cube's data.
+        if transpose:
+            points = points.T
+        return np.asarray(points.flatten())
+
+    # Align and flatten the coordinate points of the source space.
+    sx_dim, sy_dim = src_cube.coord_dims(sx), src_cube.coord_dims(sy)
+    transpose = sy_dim > sx_dim
+    sx_points = _src_align_and_flatten(sx_points, transpose)
+    sy_points = _src_align_and_flatten(sy_points, transpose)
+
+    # Match the source cube x coordinate range to the target grid
+    # cube x coordinate range.
+    min_sx, min_tx = np.min(sx_points), np.min(tx.points)
+    modulus = tx.units.modulus
+    if modulus is not None:
+        if min_sx < 0 and min_tx >= 0:
+#            indices = np.where(sx_points < 0)
+#            sx_points[indices] += modulus
+            sx_points = sx_points + modulus
+        elif min_sx >= 0 and min_tx < 0:
+#            indices = np.where(sx_points > (modulus / 2))
+#            sx_points[indices] -= modulus
+            sx_points = sx_points - (modulus / 2)
+
+    # Create target grid cube x and y cell boundaries.
+    tx_depth, ty_depth = tx.points.size, ty.points.size
+    tx_dim, = grid_cube.coord_dims(tx)
+    ty_dim, = grid_cube.coord_dims(ty)
+
+    tx_cells = np.concatenate((tx.bounds[:, 0],
+                               tx.bounds[-1, 1].reshape(1)))
+    ty_cells = np.concatenate((ty.bounds[:, 0],
+                               ty.bounds[-1, 1].reshape(1)))
+
+    # Determine the target grid cube x and y cells that bound
+    # the source cube x and y points.
+
+    def _regrid_indices(cells, depth, points):
+        # Calculate the minimum difference in cell extent.
+        extent = np.min(np.diff(cells))
+        if extent == 0:
+            # Detected an dimension coordinate with an invalid
+            # zero length cell extent.
+            msg = 'The target grid cube {} ({!r}) coordinate contains ' \
+                'a zero length cell extent.'
+            axis, name = 'x', tx.name()
+            if points is sy_points:
+                axis, name = 'y', ty.name()
+            raise ValueError(msg.format(axis, name))
+        elif extent > 0:
+            # The cells of the dimension coordinate are in ascending order.
+            indices = np.searchsorted(cells, points, side='right') - 1
+        else:
+            # The cells of the dimension coordinate are in descending order.
+            # np.searchsorted() requires ascending order, so we require to
+            # account for this restriction.
+            cells = cells[::-1]
+            right = np.searchsorted(cells, points, side='right')
+            left = np.searchsorted(cells, points, side='left')
+            indices = depth - right
+            # Only those points that exactly match the left-hand cell bound
+            # will differ between 'left' and 'right'. Thus their appropriate
+            # target cell location requires to be recalculated to give the
+            # correct descending [upper, lower) interval cell, source to target
+            # regrid behaviour.
+            delta = np.where(left != right)[0]
+            if delta.size:
+                indices[delta] = depth - left[delta]
+        return indices
+
+    x_indices = _regrid_indices(tx_cells, tx_depth, sx_points)
+    y_indices = _regrid_indices(ty_cells, ty_depth, sy_points)
+
+    # Now construct a sparse M x N matix, where M is the flattened target
+    # space, and N is the flattened source space. The sparse matrix will then
+    # be populated with those source cube points that contribute to a specific
+    # target cube cell.
+
+    import pdb; pdb.set_trace()
+
+    # Determine the valid indices and their offsets in M x N space.
+    if ma.isMaskedArray(src_cube.data):
+        # Calculate the valid M offsets, accounting for the source cube mask.
+        mask = src_cube.data.mask
+        if mask.ndim > 2:
+            mask = mask[0]
+        mask = ~mask.flatten()
+        cols = np.where((y_indices >= 0) & (y_indices < ty_depth) &
+                        (x_indices >= 0) & (x_indices < tx_depth) &
+                        mask)[0]
+    else:
+        # Calculate the valid M offsets.
+        cols = np.where((y_indices >= 0) & (y_indices < ty_depth) &
+                        (x_indices >= 0) & (x_indices < tx_depth))[0]
+
+    # Reduce the indices to only those that are valid.
+    x_indices = x_indices[cols]
+    y_indices = y_indices[cols]
+
+    # Calculate the valid N offsets.
+    if ty_dim < tx_dim:
+        rows = y_indices * tx.points.size + x_indices
+    else:
+        rows = x_indices * ty.points.size + y_indices
+
+    # XXX: No area weights for now ...
+    weights = np.ones(src_cube.shape[1:], src_cube.dtype)
+
+    shape = src_cube.shape
+    spatial_size = shape[1] * shape[2]
+    spatial_index = np.arange(spatial_size).reshape(shape[1], shape[2])
+    spatial_translate = np.repeat(np.repeat(spatial_index, sample, axis=1), sample, axis=0)
+    spatial_translate = spatial_translate.flatten()
+
 
     # Calculate the associated valid weights.
     weights_flat = weights.flatten()

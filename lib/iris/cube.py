@@ -2700,14 +2700,26 @@ bound=(1994-12-01 00:00:00, 1998-12-01 00:00:00)
 
             # having checked the metadata, now check the coordinates
             if result:
+		# print(self)
+		# print(other)
                 coord_comparison = iris.analysis.coord_comparison(self, other)
+		# print(coord_comparison)
                 # if there are any coordinates which are not equal
                 result = not (coord_comparison['not_equal'] or
                               coord_comparison['non_equal_data_dimension'])
+                # if coord_comparison['non_equal_data_dimension']:
+		# 	print(self.coord_dims('altitude'))
+		# 	print(other.coord_dims('altitude'))
+		# 	print(self.coord_dims('altitude') == other.coord_dims('altitude'))
+		# 	raise RuntimeError('NEDD' + str(coord_comparison['non_equal_data_dimension']))
+                # if coord_comparison['non_equal']:
+		# 	raise RuntimeError('NE')
+	        # raise RuntimeError('Awooga!' + str(coord_comparison['not_equal']))
 
             # having checked everything else, check approximate data
             # equality - loading the data if has not already been loaded.
             if result:
+                # raise RuntimeError('Awooga!')
                 result = np.all(np.abs(self.data - other.data) < 1e-8)
 
         return result
